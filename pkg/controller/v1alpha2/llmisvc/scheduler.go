@@ -208,13 +208,11 @@ func (r *LLMISVCReconciler) reconcileV1InferencePool(ctx context.Context, llmSvc
 	return Reconcile(ctx, r, llmSvc, &igwapi.InferencePool{}, expected, semanticInferencePoolIsEqual)
 }
 
-// reconcileV1Alpha2InferencePool reconciles the v1alpha2 InferencePool if the CRD is available.
-func (r *LLMISVCReconciler) reconcileV1Alpha2InferencePool(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, shouldDelete bool) error {
-	expected := r.expectedSchedulerInferencePoolV1Alpha2(ctx, llmSvc)
-	if shouldDelete {
-		return Delete(ctx, r, llmSvc, expected)
-	}
-	return Reconcile(ctx, r, llmSvc, &igwapiv1alpha2.InferencePool{}, expected, semanticInferencePoolV1Alpha2IsEqual)
+// reconcileV1Alpha2InferencePool removes legacy inference.networking.x-k8s.io InferencePools.
+// HTTPRoutes now always target inference.networking.k8s.io/v1, so dual-writing the v1alpha2
+// pool is unnecessary. Delete is a no-op when the CRD or object is missing.
+func (r *LLMISVCReconciler) reconcileV1Alpha2InferencePool(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, _ bool) error {
+	return Delete(ctx, r, llmSvc, r.expectedSchedulerInferencePoolV1Alpha2(ctx, llmSvc))
 }
 
 func (r *LLMISVCReconciler) reconcileSchedulerService(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) error {
@@ -1562,12 +1560,6 @@ func semanticServiceIsEqual(expected *corev1.Service, current *corev1.Service) b
 }
 
 func semanticInferencePoolIsEqual(expected *igwapi.InferencePool, curr *igwapi.InferencePool) bool {
-	return equality.Semantic.DeepDerivative(expected.Spec, curr.Spec) &&
-		equality.Semantic.DeepDerivative(expected.Labels, curr.Labels) &&
-		equality.Semantic.DeepDerivative(expected.Annotations, curr.Annotations)
-}
-
-func semanticInferencePoolV1Alpha2IsEqual(expected *igwapiv1alpha2.InferencePool, curr *igwapiv1alpha2.InferencePool) bool {
 	return equality.Semantic.DeepDerivative(expected.Spec, curr.Spec) &&
 		equality.Semantic.DeepDerivative(expected.Labels, curr.Labels) &&
 		equality.Semantic.DeepDerivative(expected.Annotations, curr.Annotations)

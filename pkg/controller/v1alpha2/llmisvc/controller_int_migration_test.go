@@ -21,10 +21,10 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/labels"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	igwapi "sigs.k8s.io/gateway-api-inference-extension/api/v1"
-	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	igwapiv1alpha2 "github.com/kserve/kserve/pkg/apis/gie/v1alpha2pool"
 
@@ -35,317 +35,107 @@ import (
 	. "github.com/kserve/kserve/pkg/testing"
 )
 
-var _ = Describe("InferencePool Migration", func() {
-	Context("Dual-pool creation (both v1 and v1alpha2 CRDs available)", func() {
-		It("should create both v1 and v1alpha2 InferencePools when both CRDs are available", func(ctx SpecContext) {
-			// given
-			svcName := "test-llm-dual-pool"
-			testNs := NewTestNamespace(ctx, envTest, WithIstioShadowService(svcName))
+var _ = Describe("InferencePool v1-only", func() {
+	It("should create only the v1 InferencePool and point HTTPRoute at it", func(ctx SpecContext) {
+		svcName := "test-llm-v1-only"
+		testNs := NewTestNamespace(ctx, envTest, WithIstioShadowService(svcName))
 
-			llmSvc := LLMInferenceService(svcName,
-				InNamespace[*v1alpha2.LLMInferenceService](testNs.Name),
-				WithModelURI("hf://facebook/opt-125m"),
-				WithManagedRoute(),
-				WithManagedGateway(),
-				WithManagedScheduler(),
-			)
+		llmSvc := LLMInferenceService(svcName,
+			InNamespace[*v1alpha2.LLMInferenceService](testNs.Name),
+			WithModelURI("hf://facebook/opt-125m"),
+			WithManagedRoute(),
+			WithManagedGateway(),
+			WithManagedScheduler(),
+		)
 
-			// when
-			Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
-			defer func() {
-				testNs.DeleteAndWait(ctx, llmSvc)
-			}()
+		Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
+		defer func() {
+			testNs.DeleteAndWait(ctx, llmSvc)
+		}()
 
-			// then - verify v1 InferencePool is created
-			expectedPoolName := svcName + "-inference-pool"
-			Eventually(func(g Gomega, ctx context.Context) error {
-				v1Pool := &igwapi.InferencePool{}
-				return envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1Pool)
-			}).WithContext(ctx).Should(Succeed(), "v1 InferencePool should be created")
+		expectedPoolName := svcName + "-inference-pool"
 
-			// then - verify v1alpha2 InferencePool is created (same name, different API group)
-			Eventually(func(g Gomega, ctx context.Context) error {
-				v1alpha2Pool := &igwapiv1alpha2.InferencePool{}
-				return envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1alpha2Pool)
-			}).WithContext(ctx).Should(Succeed(), "v1alpha2 InferencePool should be created")
-
-			// Verify both pools have correct owner reference
+		// v1 pool is created
+		Eventually(func(g Gomega, ctx context.Context) error {
 			v1Pool := &igwapi.InferencePool{}
-			Expect(envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1Pool)).To(Succeed())
-			Expect(v1Pool).To(BeOwnedBy(llmSvc))
+			return envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1Pool)
+		}).WithContext(ctx).Should(Succeed(), "v1 InferencePool should be created")
 
+		v1Pool := &igwapi.InferencePool{}
+		Expect(envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1Pool)).To(Succeed())
+		Expect(v1Pool).To(BeOwnedBy(llmSvc))
+
+		// v1alpha2 pool is not created (or is deleted if present)
+		Consistently(func(g Gomega, ctx context.Context) {
 			v1alpha2Pool := &igwapiv1alpha2.InferencePool{}
-			Expect(envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1alpha2Pool)).To(Succeed())
-			Expect(v1alpha2Pool).To(BeOwnedBy(llmSvc))
+			err := envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1alpha2Pool)
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "v1alpha2 InferencePool should not exist")
+		}).WithContext(ctx).Should(Succeed())
 
-			// Note: In envtest, the v1 pool is considered ready immediately (no status conditions = valid pool = ready),
-			// so migration may happen before we can check. The key assertion is that both pools are created.
-			// The migration annotation and HTTPRoute swap behavior are tested in separate test cases.
-		})
+		// HTTPRoute uses v1 group and migration annotation
+		Eventually(func(g Gomega, ctx context.Context) error {
+			routes, errList := managedRoutes(ctx, llmSvc)
+			g.Expect(errList).ToNot(HaveOccurred())
+			g.Expect(routes).To(HaveLen(1))
 
-		It("should point HTTPRoute backendRef to v1alpha2 pool initially (before migration)", func(ctx SpecContext) {
-			// given
-			svcName := "test-llm-initial-backend"
-			testNs := NewTestNamespace(ctx, envTest, WithIstioShadowService(svcName))
+			route := &routes[0]
+			g.Expect(route.Spec.Rules).ToNot(BeEmpty())
+			g.Expect(route.Spec.Rules[0].BackendRefs).ToNot(BeEmpty())
 
-			llmSvc := LLMInferenceService(svcName,
-				InNamespace[*v1alpha2.LLMInferenceService](testNs.Name),
-				WithModelURI("hf://facebook/opt-125m"),
-				WithManagedRoute(),
-				WithManagedGateway(),
-				WithManagedScheduler(),
-			)
-
-			// when
-			Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
-			defer func() {
-				testNs.DeleteAndWait(ctx, llmSvc)
-			}()
-
-			// then - verify HTTPRoute points to v1alpha2 pool (API group)
-			Eventually(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
-
-				route := &routes[0]
-				g.Expect(route.Spec.Rules).ToNot(BeEmpty())
-				g.Expect(route.Spec.Rules[0].BackendRefs).ToNot(BeEmpty())
-
-				// Check that the backendRef points to v1alpha2 API group
-				backendRef := route.Spec.Rules[0].BackendRefs[0]
-				g.Expect(backendRef.Group).ToNot(BeNil())
-				g.Expect(string(*backendRef.Group)).To(Equal(constants.InferencePoolV1Alpha2APIGroupName),
-					"HTTPRoute backendRef should initially point to v1alpha2 API group")
-
-				return nil
-			}).WithContext(ctx).Should(Succeed())
-		})
+			backendRef := route.Spec.Rules[0].BackendRefs[0]
+			g.Expect(backendRef.Group).ToNot(BeNil())
+			g.Expect(string(*backendRef.Group)).To(Equal(constants.InferencePoolV1APIGroupName))
+			g.Expect(route.Annotations).To(HaveKeyWithValue(llmisvc.AnnotationInferencePoolMigrated, "v1"))
+			return nil
+		}).WithContext(ctx).Should(Succeed())
 	})
 
-	Context("Pre-migrated deployments (HTTPRoute annotation)", func() {
-		It("should keep HTTPRoute pointing to v1 pool when migration annotation is already on HTTPRoute", func(ctx SpecContext) {
-			// given
-			svcName := "test-llm-pre-migrated"
-			testNs := NewTestNamespace(ctx, envTest, WithIstioShadowService(svcName))
+	It("should delete a pre-existing owned v1alpha2 InferencePool", func(ctx SpecContext) {
+		svcName := "test-llm-cleanup-alpha2"
+		testNs := NewTestNamespace(ctx, envTest, WithIstioShadowService(svcName))
 
-			// Create LLMInferenceService (no annotation - migration state is on HTTPRoute)
-			llmSvc := LLMInferenceService(svcName,
-				InNamespace[*v1alpha2.LLMInferenceService](testNs.Name),
-				WithModelURI("hf://facebook/opt-125m"),
-				WithManagedRoute(),
-				WithManagedGateway(),
-				WithManagedScheduler(),
-			)
+		llmSvc := LLMInferenceService(svcName,
+			InNamespace[*v1alpha2.LLMInferenceService](testNs.Name),
+			WithModelURI("hf://facebook/opt-125m"),
+			WithManagedRoute(),
+			WithManagedGateway(),
+			WithManagedScheduler(),
+		)
+		Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
+		defer func() {
+			testNs.DeleteAndWait(ctx, llmSvc)
+		}()
 
-			// when
-			Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
-			defer func() {
-				testNs.DeleteAndWait(ctx, llmSvc)
-			}()
+		expectedPoolName := svcName + "-inference-pool"
 
-			// Wait for HTTPRoute to be created with v1alpha2 backendRef initially
-			var managedRoute *gwapiv1.HTTPRoute
-			Eventually(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
-				managedRoute = &routes[0]
-				return nil
-			}).WithContext(ctx).Should(Succeed())
+		// Wait for the service to reconcile once
+		Eventually(func(g Gomega, ctx context.Context) error {
+			v1Pool := &igwapi.InferencePool{}
+			return envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1Pool)
+		}).WithContext(ctx).Should(Succeed())
 
-			// Simulate existing migration annotation on HTTPRoute (as if Gateway had rejected before)
-			updatedRoute := managedRoute.DeepCopy()
-			if updatedRoute.Annotations == nil {
-				updatedRoute.Annotations = make(map[string]string)
-			}
-			updatedRoute.Annotations[llmisvc.AnnotationInferencePoolMigrated] = "v1"
-			Expect(envTest.Client.Update(ctx, updatedRoute)).To(Succeed())
+		// Inject a legacy owned v1alpha2 pool as if left over from dual-write
+		fresh := &v1alpha2.LLMInferenceService{}
+		Expect(envTest.Client.Get(ctx, client.ObjectKeyFromObject(llmSvc), fresh)).To(Succeed())
+		legacy := &igwapiv1alpha2.InferencePool{}
+		legacy.Name = expectedPoolName
+		legacy.Namespace = testNs.Name
+		legacy.Labels = llmisvc.SchedulerLabels(llmSvc)
+		legacy.Spec.Selector = map[igwapiv1alpha2.LabelKey]igwapiv1alpha2.LabelValue{"app": "test"}
+		legacy.Spec.TargetPortNumber = 8000
+		Expect(controllerutil.SetControllerReference(fresh, legacy, envTest.Client.Scheme())).To(Succeed())
+		Expect(envTest.Client.Create(ctx, legacy)).To(Succeed())
 
-			// Trigger reconciliation by updating the LLMInferenceService
-			llmSvcUpdated := &v1alpha2.LLMInferenceService{}
-			Expect(envTest.Client.Get(ctx, client.ObjectKeyFromObject(llmSvc), llmSvcUpdated)).To(Succeed())
-			if llmSvcUpdated.Annotations == nil {
-				llmSvcUpdated.Annotations = make(map[string]string)
-			}
-			llmSvcUpdated.Annotations["trigger-reconcile"] = "true"
-			Expect(envTest.Client.Update(ctx, llmSvcUpdated)).To(Succeed())
 
-			// then - HTTPRoute should point to v1 pool (respecting annotation)
-			Eventually(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
+		// Trigger reconcile
+		fresh.Annotations = map[string]string{"trigger-reconcile": "true"}
+		Expect(envTest.Client.Update(ctx, fresh)).To(Succeed())
 
-				route := &routes[0]
-				g.Expect(route.Spec.Rules).ToNot(BeEmpty())
-				g.Expect(route.Spec.Rules[0].BackendRefs).ToNot(BeEmpty())
-
-				// Check that the backendRef points to v1 API group (respecting annotation)
-				backendRef := route.Spec.Rules[0].BackendRefs[0]
-				g.Expect(backendRef.Group).ToNot(BeNil())
-				g.Expect(string(*backendRef.Group)).To(Equal(constants.InferencePoolV1APIGroupName),
-					"HTTPRoute backendRef should point to v1 API group when migration annotation is set")
-
-				// Also verify annotation is still present
-				g.Expect(route.Annotations).To(HaveKeyWithValue(
-					llmisvc.AnnotationInferencePoolMigrated, "v1"),
-					"HTTPRoute migration annotation should remain 'v1'")
-
-				return nil
-			}).WithContext(ctx).Should(Succeed())
-		})
-	})
-
-	Context("Gateway rejection triggers migration to v1", func() {
-		It("should swap HTTPRoute backendRef from v1alpha2 to v1 when Gateway rejects v1alpha2", func(ctx SpecContext) {
-			// given
-			svcName := "test-llm-gateway-rejection"
-			testNs := NewTestNamespace(ctx, envTest, WithIstioShadowService(svcName))
-
-			llmSvc := LLMInferenceService(svcName,
-				InNamespace[*v1alpha2.LLMInferenceService](testNs.Name),
-				WithModelURI("hf://facebook/opt-125m"),
-				WithManagedRoute(),
-				WithManagedGateway(),
-				WithManagedScheduler(),
-			)
-
-			// when - create the LLMInferenceService
-			Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
-			defer func() {
-				testNs.DeleteAndWait(ctx, llmSvc)
-			}()
-
-			// Wait for HTTPRoute to be created with v1alpha2 backendRef initially
-			var managedRoute *gwapiv1.HTTPRoute
-			Eventually(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
-				managedRoute = &routes[0]
-				return nil
-			}).WithContext(ctx).Should(Succeed())
-
-			// Simulate Gateway rejection: set ResolvedRefs=False, Reason=InvalidKind
-			// This is what Envoy Gateway does when it doesn't support v1alpha2 backendRef
-			updatedRoute := managedRoute.DeepCopy()
-			WithHTTPRouteV1Alpha2RejectedStatus(DefaultGatewayControllerName)(updatedRoute)
-			Expect(envTest.Client.Status().Update(ctx, updatedRoute)).To(Succeed())
-
-			// then - controller should detect rejection and swap to v1 backendRef
-			Eventually(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
-
-				route := &routes[0]
-				g.Expect(route.Spec.Rules).ToNot(BeEmpty())
-				g.Expect(route.Spec.Rules[0].BackendRefs).ToNot(BeEmpty())
-
-				// Check that the backendRef now points to v1 API group (after migration)
-				backendRef := route.Spec.Rules[0].BackendRefs[0]
-				g.Expect(backendRef.Group).ToNot(BeNil())
-				g.Expect(string(*backendRef.Group)).To(Equal(constants.InferencePoolV1APIGroupName),
-					"HTTPRoute backendRef should point to v1 API group after Gateway rejects v1alpha2")
-
-				// Verify migration annotation is set on HTTPRoute (one-way lock)
-				g.Expect(route.Annotations).To(HaveKeyWithValue(
-					llmisvc.AnnotationInferencePoolMigrated, "v1"),
-					"HTTPRoute should have migration annotation after Gateway rejection")
-
-				return nil
-			}).WithContext(ctx).Should(Succeed())
-		})
-	})
-
-	Context("Migration lock (prevents flapping)", func() {
-		It("should not change migration annotation on HTTPRoute once set to v1", func(ctx SpecContext) {
-			// given
-			svcName := "test-llm-migration-lock"
-			testNs := NewTestNamespace(ctx, envTest, WithIstioShadowService(svcName))
-
-			// Create LLMInferenceService
-			llmSvc := LLMInferenceService(svcName,
-				InNamespace[*v1alpha2.LLMInferenceService](testNs.Name),
-				WithModelURI("hf://facebook/opt-125m"),
-				WithManagedRoute(),
-				WithManagedGateway(),
-				WithManagedScheduler(),
-			)
-
-			Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
-			defer func() {
-				testNs.DeleteAndWait(ctx, llmSvc)
-			}()
-
-			// Wait for HTTPRoute to be created
-			var managedRoute *gwapiv1.HTTPRoute
-			Eventually(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
-				managedRoute = &routes[0]
-				return nil
-			}).WithContext(ctx).Should(Succeed())
-
-			// Simulate Gateway rejection to trigger migration
-			updatedRoute := managedRoute.DeepCopy()
-			WithHTTPRouteV1Alpha2RejectedStatus(DefaultGatewayControllerName)(updatedRoute)
-			Expect(envTest.Client.Status().Update(ctx, updatedRoute)).To(Succeed())
-
-			// Wait for migration to complete (annotation set on HTTPRoute)
-			Eventually(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
-				g.Expect(routes[0].Annotations).To(HaveKeyWithValue(
-					llmisvc.AnnotationInferencePoolMigrated, "v1"))
-				return nil
-			}).WithContext(ctx).Should(Succeed())
-
-			// Verify migration annotation remains "v1" on HTTPRoute (not changed) across multiple reconciles
-			Consistently(func(g Gomega, ctx context.Context) error {
-				routes, errList := managedRoutes(ctx, llmSvc)
-				g.Expect(errList).ToNot(HaveOccurred())
-				g.Expect(routes).To(HaveLen(1))
-
-				route := &routes[0]
-				g.Expect(route.Annotations).To(HaveKeyWithValue(
-					llmisvc.AnnotationInferencePoolMigrated, "v1"),
-					"HTTPRoute migration annotation should remain 'v1' (one-way lock)")
-
-				// Verify backendRef still points to v1
-				g.Expect(route.Spec.Rules).ToNot(BeEmpty())
-				g.Expect(route.Spec.Rules[0].BackendRefs).ToNot(BeEmpty())
-				backendRef := route.Spec.Rules[0].BackendRefs[0]
-				g.Expect(backendRef.Group).ToNot(BeNil())
-				g.Expect(string(*backendRef.Group)).To(Equal(constants.InferencePoolV1APIGroupName))
-
-				return nil
-			}).WithContext(ctx).Should(Succeed())
-		})
+		// Controller should remove it
+		Eventually(func(g Gomega, ctx context.Context) {
+			v1alpha2Pool := &igwapiv1alpha2.InferencePool{}
+			err := envTest.Client.Get(ctx, client.ObjectKey{Name: expectedPoolName, Namespace: testNs.Name}, v1alpha2Pool)
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		}).WithContext(ctx).Should(Succeed())
 	})
 })
-
-// Helper to list managed InferencePools
-func managedInferencePools(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) (*igwapi.InferencePoolList, error) {
-	pools := &igwapi.InferencePoolList{}
-	listOpts := &client.ListOptions{
-		Namespace:     llmSvc.Namespace,
-		LabelSelector: labels.SelectorFromSet(llmisvc.SchedulerLabels(llmSvc)),
-	}
-	err := envTest.List(ctx, pools, listOpts)
-	return pools, err
-}
-
-// Helper to list managed v1alpha2 InferencePools
-func managedInferencePoolsV1Alpha2(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) (*igwapiv1alpha2.InferencePoolList, error) {
-	pools := &igwapiv1alpha2.InferencePoolList{}
-	listOpts := &client.ListOptions{
-		Namespace:     llmSvc.Namespace,
-		LabelSelector: labels.SelectorFromSet(llmisvc.SchedulerLabels(llmSvc)),
-	}
-	err := envTest.List(ctx, pools, listOpts)
-	return pools, err
-}

@@ -827,12 +827,12 @@ var _ = Describe("LLMInferenceService Controller", func() {
 
 				ensureRouterManagedResourcesAreReady(ctx, envTest.Client, llmSvc)
 
-				// HTTPRoute uses v1alpha2 backendRef for InferencePool rules when both CRDs are available
+				// HTTPRoute uses v1 backendRef for InferencePool rules
 				Eventually(func(g Gomega, ctx context.Context) {
 					routes, errList := managedRoutes(ctx, llmSvc)
 					g.Expect(errList).ToNot(HaveOccurred())
 					g.Expect(routes).To(HaveLen(1))
-					g.Expect(&routes[0]).To(HaveBackendRefs(BackendRefInferencePoolV1Alpha2(svcName + "-inference-pool")))
+					g.Expect(&routes[0]).To(HaveBackendRefs(BackendRefInferencePool(svcName + "-inference-pool")))
 				}).WithContext(ctx).Should(Succeed())
 
 				Eventually(func(g Gomega, ctx context.Context) error {
